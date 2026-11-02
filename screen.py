@@ -10,11 +10,16 @@ ENTRY_LAG = 2      # 検証の買値: 申込日からこの営業日後の始値
 HORIZONS = (1, 5, 10, 20)
 BENCH = "1306.T"
 # --- 以下は配信の発言から読み取った目安（動画が明示した閾値ではありません）。検証しながら見直す ---
-TURN_HEAVY = 2.0   # 買い残が出来高(20日平均)の何日分か: 重い
-TURN_MID = 0.5     # 同: 注意
+TURN_HEAVY = 3.0   # 買い残が出来高(20日平均)の何日分か: 重い（判定対象の上位約25%）
+TURN_MID = 1.0     # 同: 注意（中央値付近）
+TURN_MAX = 100.0   # これを超える回転日数は、分割などによる異常値とみて「不明」にする
 BUYCHG_TH = 5.0    # 買い残の増減（%）: 増加・減少の判定
 DEADLINE_MIN, DEADLINE_MAX = 4.5, 6.0   # 高値から何か月: 信用買いの6か月期限が近い窓
 DC_GAP = 0.02      # 50日線が200日線の何%以内なら「デッドクロス接近」
+# スコアv2の加減点（0にすると、フラグとして記録するだけで点数には影響しません）
+W_TURN_HEAVY, W_TURN_MID = -1, 0
+W_BUY_UP, W_BUY_DOWN = 0, 0      # 買い残の増減: 初回の検証で期待と逆向きだったため、いったん0
+W_DEADLINE, W_DC = -1, -1
 WATCH_MIN = 20.0   # 年末の拾い候補ウォッチに入れる信用残合計（億円）
 
 def num(s):
@@ -102,7 +107,7 @@ def add_flags(res):
     res["buy_trend"] = np.where(chg >= BUYCHG_TH, "増加", np.where(chg <= -BUYCHG_TH, "減少", "横ばい"))
     # 買い残の回転（出来高の何日分か）
     res["turn_days"] = np.where(res.avg_vol20 > 0, res.buy_sh / res.avg_vol20, np.nan)
-    res["turn_level"] = np.where(res.turn_days >= TURN_HEAVY, "重い", np.where(res.turn_days >= TURN_MID, "注意", np.where(res.turn_days.notna(), "軽め", "不明")))
+    res["turn_level"] = np.where(res.turn_days > TURN_MAX, "不明", np.where(res.turn_days >= TURN_HEAVY, "重い", np.where(res.turn_days >= TURN_MID, "注意", np.where(res.turn_days.notna(), "軽め", "不明"))))
     # 高値から半年の期限接近
     res["deadline_near"] = (res.months_from_high >= DEADLINE_MIN) & (res.months_from_high < DEADLINE_MAX) & (res.ratio > 3)
     # 長期線のクロス状態
@@ -112,10 +117,10 @@ def add_flags(res):
 
 def score_v2(r):
     adj = 0
-    adj += {"増加": -1, "減少": 1}.get(r["buy_trend"], 0)
-    adj += -2 if r["turn_level"] == "重い" else (-1 if r["turn_level"] == "注意" else 0)
-    adj += -1 if r["deadline_near"] else 0
-    adj += -1 if r["dc_near"] else 0
+    adj += {"増加": W_BUY_UP, "減少": W_BUY_DOWN}.get(r["buy_trend"], 0)
+    adj += W_TURN_HEAVY if r["turn_level"] == "重い" else (W_TURN_MID if r["turn_level"] == "注意" else 0)
+    adj += W_DEADLINE if r["deadline_near"] else 0
+    adj += W_DC if r["dc_near"] else 0
     return r["score"] + adj
 
 def build(df, tdf, th):
