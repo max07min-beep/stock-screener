@@ -6,9 +6,16 @@ SELL_TH = 8000     # 売り残の枯渇ライン（億円）
 FETCH_MIN = 1.0    # 株価を取得する最小の信用残合計（億円）
 LIQ_MIN = 10.0     # 判定の対象にする信用残合計（億円）。これ未満は「対象外（信用残小）」
 CHUNK = 150
-ENTRY_LAG = 2      # 検証の買値: 申込日から数えてこの営業日後の「始値」（公表が申込日の翌営業日以降のため保守的に2）
-HORIZONS = (1, 5, 10, 20)   # 買値からの営業日数（買値の日を1日目とした終値で測る）
-BENCH = "1306.T"   # 比較用のTOPIX連動ETF
+ENTRY_LAG = 2      # 検証の買値: 申込日からこの営業日後の始値
+HORIZONS = (1, 5, 10, 20)
+BENCH = "1306.T"
+# --- 以下は配信の発言から読み取った目安（動画が明示した閾値ではありません）。検証しながら見直す ---
+TURN_HEAVY = 2.0   # 買い残が出来高(20日平均)の何日分か: 重い
+TURN_MID = 0.5     # 同: 注意
+BUYCHG_TH = 5.0    # 買い残の増減（%）: 増加・減少の判定
+DEADLINE_MIN, DEADLINE_MAX = 4.5, 6.0   # 高値から何か月: 信用買いの6か月期限が近い窓
+DC_GAP = 0.02      # 50日線が200日線の何%以内なら「デッドクロス接近」
+WATCH_MIN = 20.0   # 年末の拾い候補ウォッチに入れる信用残合計（億円）
 
 def num(s):
     s = s.strip()
@@ -41,18 +48,24 @@ def parse_pdf(path):
         if not r.get("mk") or "sh" not in r or "val" not in r: continue
         s, v = r["sh"], r["val"]
         sell, buy = s[0] or 0, s[3] or 0
+        bchg = s[4] or 0
         rows.append(dict(code=c[:4] if c[4] == "0" else c, name=r["name"], market=r["mk"],
                          ratio=(buy / sell if sell > 0 else 99.0),
-                         buy_oku=(v[3] or 0) / 1e8, sell_oku=(v[0] or 0) / 1e8))
+                         buy_oku=(v[3] or 0) / 1e8, sell_oku=(v[0] or 0) / 1e8,
+                         buy_sh=buy, buy_chg_1d=(bchg / (buy - bchg) * 100 if buy - bchg > 0 else np.nan)))
     return pd.DataFrame(rows)
 
-def tech(close):
-    close = close.dropna()
+def tech(d):
+    """d: Open/Close/Volume を持つ日足（判定日までに切ったもの）"""
+    close = d["Close"].dropna()
     if len(close) < 210: return None
-    ma = {n: close.rolling(n).mean().iloc[-1] for n in (25, 50, 75, 200)}
+    ma = {n: close.rolling(n).mean() for n in (25, 50, 75, 100, 200)}
     win = close.iloc[-250:]
     months = (close.index[-1] - win.idxmax()).days / 30.4
-    return dict(price=close.iloc[-1], ma25=ma[25], ma50=ma[50], ma75=ma[75], ma200=ma[200], months_from_high=months)
+    vol = d["Volume"].tail(20).mean() if "Volume" in d else np.nan
+    return dict(price=close.iloc[-1], ma25=ma[25].iloc[-1], ma50=ma[50].iloc[-1], ma75=ma[75].iloc[-1],
+                ma100=ma[100].iloc[-1], ma200=ma[200].iloc[-1], ma50_prev=ma[50].iloc[-6],
+                months_from_high=months, avg_vol20=vol)
 
 def score(r):
     ratio = r["ratio"]
@@ -76,18 +89,53 @@ def verdict(r, th):
     if r["score"] <= -3: return "回避・戻り売り"
     return "様子見"
 
+def verdict2(r, th):
+    if r["buy_oku"] + r["sell_oku"] < LIQ_MIN: return "対象外（信用残小）"
+    if r["score_v2"] >= th: return "買い候補"
+    if r["score_v2"] <= -3: return "回避・戻り売り"
+    return "様子見"
+
+def add_flags(res):
+    # 買い残の増減
+    chg = res.buy_chg_5d.where(res.buy_chg_5d.notna(), res.buy_chg_1d)
+    res["buy_chg_used"] = chg
+    res["buy_trend"] = np.where(chg >= BUYCHG_TH, "増加", np.where(chg <= -BUYCHG_TH, "減少", "横ばい"))
+    # 買い残の回転（出来高の何日分か）
+    res["turn_days"] = np.where(res.avg_vol20 > 0, res.buy_sh / res.avg_vol20, np.nan)
+    res["turn_level"] = np.where(res.turn_days >= TURN_HEAVY, "重い", np.where(res.turn_days >= TURN_MID, "注意", np.where(res.turn_days.notna(), "軽め", "不明")))
+    # 高値から半年の期限接近
+    res["deadline_near"] = (res.months_from_high >= DEADLINE_MIN) & (res.months_from_high < DEADLINE_MAX) & (res.ratio > 3)
+    # 長期線のクロス状態
+    res["lt_gc"] = (res.ma50 > res.ma200).astype(int) + (res.ma75 > res.ma200).astype(int) + (res.ma100 > res.ma200).astype(int)
+    res["dc_near"] = (res.ma50 > res.ma200) & ((res.ma50 / res.ma200 - 1) < DC_GAP) & (res.ma50 < res.ma50_prev)
+    return res
+
+def score_v2(r):
+    adj = 0
+    adj += {"増加": -1, "減少": 1}.get(r["buy_trend"], 0)
+    adj += -2 if r["turn_level"] == "重い" else (-1 if r["turn_level"] == "注意" else 0)
+    adj += -1 if r["deadline_near"] else 0
+    adj += -1 if r["dc_near"] else 0
+    return r["score"] + adj
+
 def build(df, tdf, th):
     res = df.merge(tdf, on="code")
+    if "buy_chg_5d" not in res: res["buy_chg_5d"] = np.nan
     res["score"] = res.apply(score, axis=1)
     res["position"] = res.months_from_high.apply(position)
     res["verdict"] = res.apply(lambda r: verdict(r, th), axis=1)
     res["total_oku"] = res.buy_oku + res.sell_oku
+    res = add_flags(res)
+    res["score_v2"] = res.apply(score_v2, axis=1)
+    res["verdict_v2"] = res.apply(lambda r: verdict2(r, th), axis=1)
     return res.sort_values(["score", "total_oku"], ascending=[False, False])
 
 COLS = ["code", "name", "market", "score", "verdict", "position", "ratio", "buy_oku", "sell_oku", "total_oku",
-        "price", "ma25", "ma50", "ma75", "ma200", "months_from_high"]
+        "price", "ma25", "ma50", "ma75", "ma100", "ma200", "months_from_high",
+        "buy_chg_used", "buy_trend", "turn_days", "turn_level", "deadline_near", "lt_gc", "dc_near", "score_v2", "verdict_v2"]
 JP = ["コード", "名称", "市場", "スコア", "判定", "位置づけ", "信用倍率", "買い残(億円)", "売り残(億円)", "信用残合計(億円)",
-      "株価", "25日線", "50日線", "75日線", "200日線", "高値からの月数"]
+      "株価", "25日線", "50日線", "75日線", "100日線", "200日線", "高値からの月数",
+      "買い残変化(%)", "買い残の動き", "回転日数", "回転", "半年期限接近", "長期GC数(0-3)", "DC接近", "スコアv2", "判定v2"]
 
 def norm(df):
     df = df.copy()
@@ -111,7 +159,7 @@ def fetch(codes):
                 print("retry", e, flush=True); time.sleep(10)
         if px is None: continue
         for c, t in zip(chunk, tk):
-            try: d = px[t][["Open", "Close"]].dropna()
+            try: d = px[t][["Open", "Close", "Volume"]].dropna(subset=["Open", "Close"])
             except Exception: continue
             if len(d): out[c] = norm(d)
         time.sleep(3)
@@ -124,7 +172,6 @@ def fetch_bench():
     return norm(b[["Open", "Close"]].dropna())
 
 def forward(d, date, bench):
-    """申込日 date のシグナルに対し、ENTRY_LAG営業日後の始値で買った場合の、その後の騰落率(%)と、TOPIX ETFに対する超過(%)"""
     pos = d.index.searchsorted(date, side="right") - 1
     e = pos + ENTRY_LAG
     if pos < 0 or e >= len(d): return {}
@@ -144,7 +191,8 @@ def forward(d, date, bench):
 def agg(g):
     out = {"件数": len(g)}
     for h in HORIZONS:
-        r, x = g[f"{h}日後%"] if f"{h}日後%" in g else None, g[f"{h}日後_超過%"] if f"{h}日後_超過%" in g else None
+        r = g[f"{h}日後%"] if f"{h}日後%" in g else None
+        x = g[f"{h}日後_超過%"] if f"{h}日後_超過%" in g else None
         n = int(r.notna().sum()) if r is not None else 0
         out[f"{h}日後_件数"] = n
         out[f"{h}日後_平均%"] = round(r.mean(), 2) if n else None
@@ -152,28 +200,41 @@ def agg(g):
         out[f"{h}日後_超過平均%"] = round(x.mean(), 2) if x is not None and x.notna().sum() else None
     return out
 
-def summarize(fw):
+def summarize(fw, col):
     rows = []
-    for v, g in fw.groupby("判定"):
+    for v, g in fw.groupby(col):
         rows.append({"日付": "全期間", "判定": v, **agg(g)})
-    for (d, v), g in fw.groupby(["日付", "判定"]):
+    for (d, v), g in fw.groupby(["日付", col]):
         rows.append({"日付": d, "判定": v, **agg(g)})
+    return pd.DataFrame(rows)
+
+def flag_summary(fw):
+    rows = []
+    for col in ["買い残の動き", "回転", "半年期限接近", "DC接近", "長期GC数"]:
+        for v, g in fw.groupby(col):
+            rows.append({"フラグ": col, "値": v, **agg(g)})
     return pd.DataFrame(rows)
 
 def process(parsed, prices, bench):
     os.makedirs("history", exist_ok=True)
+    dates = sorted(parsed)
     logs, fw_rows, latest = [], [], None
-    for date in sorted(parsed):
+    for i, date in enumerate(dates):
         df = parsed[date]
         sell_total, buy_total = df.sell_oku.sum(), df.buy_oku.sum()
         th = 3 + (1 if sell_total < SELL_TH else 0)
+        # 過去のPDFがあれば、最大5営業日前との買い残の変化率を出す
+        if i >= 1:
+            prev = parsed[dates[max(0, i - 4)]][["code", "buy_sh"]].rename(columns={"buy_sh": "prev_buy"})
+            df = df.merge(prev, on="code", how="left")
+            df["buy_chg_5d"] = np.where(df.prev_buy > 0, (df.buy_sh / df.prev_buy - 1) * 100, np.nan)
         df = df[(df.buy_oku + df.sell_oku) >= FETCH_MIN].reset_index(drop=True)
         ts = pd.Timestamp(date)
         rows = []
         for c in df.code:
             d = prices.get(c)
             if d is None: continue
-            t = tech(d["Close"][d.index <= ts])
+            t = tech(d[d.index <= ts])
             if t: rows.append(dict(code=c, **t))
         if not rows:
             print(date, "株価を取得できず、スキップ"); continue
@@ -183,23 +244,36 @@ def process(parsed, prices, bench):
         vc = res.verdict.value_counts()
         logs.append(dict(日付=date, 売り残億円=round(sell_total), 買い残億円=round(buy_total), 倍率=round(buy_total / sell_total, 2),
                          買い候補_需給改善型=int(vc.get("買い候補（需給改善型）", 0)), 買い候補_勢い型=int(vc.get("買い候補（勢い型）", 0)),
-                         買い候補_中間=int(vc.get("買い候補（中間）", 0)), 回避=int(vc.get("回避・戻り売り", 0))))
+                         買い候補_中間=int(vc.get("買い候補（中間）", 0)), 回避=int(vc.get("回避・戻り売り", 0)),
+                         買い候補_v2=int((res.verdict_v2 == "買い候補").sum())))
         for r in res[res.verdict != "対象外（信用残小）"].itertuples():
             f = forward(prices[r.code], ts, bench)
-            if f: fw_rows.append(dict(日付=date, コード=r.code, 名称=r.name, 判定=r.verdict, スコア=r.score, **f))
+            if f:
+                fw_rows.append(dict(日付=date, コード=r.code, 名称=r.name, 判定=r.verdict, スコア=r.score, 判定v2=r.verdict_v2, スコアv2=r.score_v2,
+                                    買い残の動き=r.buy_trend, 回転=r.turn_level, 半年期限接近=bool(r.deadline_near),
+                                    DC接近=bool(r.dc_near), 長期GC数=int(r.lt_gc), **f))
         latest = (date, res, table, sell_total, buy_total, th, vc, len(df))
     if latest is None: sys.exit("結果を作れませんでした")
     date, res, table, sell_total, buy_total, th, vc, nfetch = latest
     table.to_csv("result.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(logs).to_csv("history/summary_log.csv", index=False, encoding="utf-8-sig")
+    # 年末の拾い候補ウォッチ（今は回避。投げ売りが出た後に再点検する銘柄）
+    w = res[(res.verdict == "回避・戻り売り") & (res.total_oku >= WATCH_MIN)].sort_values("buy_oku", ascending=False)
+    wt = w[["code", "name", "market", "score", "ratio", "buy_oku", "sell_oku", "price", "months_from_high", "turn_days", "buy_trend"]].round(2)
+    wt.columns = ["コード", "名称", "市場", "スコア", "信用倍率", "買い残(億円)", "売り残(億円)", "株価", "高値からの月数", "回転日数", "買い残の動き"]
+    wt.to_csv("history/watchlist_latest.csv", index=False, encoding="utf-8-sig")
     with open("summary.txt", "w", encoding="utf-8") as f:
         f.write(f"最新の申込日: {date}\n普通株 信用売り残 {sell_total:.0f}億円 / 買い残 {buy_total:.0f}億円 / 倍率 {buy_total/sell_total:.2f}\n")
         f.write(f"売り残{SELL_TH}億円未満(燃料枯渇): {sell_total < SELL_TH}  買い候補の閾値: {th}点以上\n株価を取得できた銘柄: {len(res)} / {nfetch}\n")
         f.write("判定の内訳:\n" + vc.to_string() + "\n")
+        f.write("判定v2の内訳:\n" + res.verdict_v2.value_counts().to_string() + "\n")
+        f.write(f"年末の拾い候補ウォッチ: {len(wt)}銘柄 (history/watchlist_latest.csv)\n")
     if fw_rows:
         fw = pd.DataFrame(fw_rows)
         fw.round(2).to_csv("history/forward_detail.csv", index=False, encoding="utf-8-sig")
-        summarize(fw).to_csv("history/forward_summary.csv", index=False, encoding="utf-8-sig")
+        summarize(fw, "判定").to_csv("history/forward_summary.csv", index=False, encoding="utf-8-sig")
+        summarize(fw, "判定v2").to_csv("history/forward_summary_v2.csv", index=False, encoding="utf-8-sig")
+        flag_summary(fw).to_csv("history/forward_flags.csv", index=False, encoding="utf-8-sig")
 
 def main():
     items = {}
